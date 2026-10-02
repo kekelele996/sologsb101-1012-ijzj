@@ -1,6 +1,7 @@
 /**
  * 标定 slice：维护标定记录、筛选条件与灵敏度派生值；
  * 同时维护更换记录（合格评定与更换提醒同属标定成果的下游动作）。
+ * 标定记录跟着物理仪器（序列号）走；更换记录推进到「已更换」时回写安装位序列号。
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import { db, createId, watchTable } from '@/utils/db';
@@ -13,6 +14,7 @@ import { createEmptyCalibrationFilter, judgeCalibration, sensitivityDelta } from
 import type { Replace, ReplaceFilterState, ReplaceState } from '@/types/replace';
 import { canTransition, createEmptyReplaceFilter } from '@/types/replace';
 import type { Instrument } from '@/types/instrument';
+import { qualifyExpiryDateOf } from '@/types/instrument';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -41,6 +43,18 @@ const initialState: CalibrationSliceState = {
   lastReceipt: '',
 };
 
+/** 按最近一次标定日期重算物理仪器的合格到期日 */
+async function recomputeQualifyExpiryDate(instrumentId: string): Promise<void> {
+  const instrument = await db.instruments.get(instrumentId);
+  if (!instrument) return;
+  const rows = await db.calibrations.where('instrumentId').equals(instrumentId).toArray();
+  const lastDate = rows.map((row) => row.date).sort().pop() ?? null;
+  await db.instruments.update(instrumentId, {
+    qualifyExpiryDate: qualifyExpiryDateOf(lastDate, null),
+    updatedAt: Date.now(),
+  } as never);
+}
+
 export const createCalibration = createAsyncThunk(
   'calibration/createCalibration',
   async (payload: Omit<Calibration, 'id' | 'createdAt' | 'updatedAt' | 'responseVerdict'>) => {
@@ -59,12 +73,13 @@ export const createCalibration = createAsyncThunk(
       updatedAt: now,
     };
     await db.calibrations.put(row);
-    // 标定完成后按结论回写仪器状态
+    // 标定完成后按结论回写仪器状态，并重算合格到期日
     if (instrument) {
       await db.instruments.update(instrument.id, {
         state: verdict === '不合格' ? '待标定' : '在用',
         updatedAt: now,
       } as never);
+      await recomputeQualifyExpiryDate(instrument.id);
     }
     return row;
   }
@@ -83,6 +98,7 @@ export const updateCalibration = createAsyncThunk(
       responseVerdict: payload.patch.responseVerdict ?? verdict,
       updatedAt: Date.now(),
     } as never);
+    if (instrument) await recomputeQualifyExpiryDate(instrument.id);
     return payload;
   }
 );
@@ -90,7 +106,9 @@ export const updateCalibration = createAsyncThunk(
 export const removeCalibration = createAsyncThunk(
   'calibration/removeCalibration',
   async (calibrationId: string) => {
+    const existing = await db.calibrations.get(calibrationId);
     await db.calibrations.delete(calibrationId);
+    if (existing) await recomputeQualifyExpiryDate(existing.instrumentId);
     return calibrationId;
   }
 );
@@ -133,28 +151,34 @@ export const updateReplace = createAsyncThunk(
 
 /**
  * 推进更换状态机：
- * 流转到「已更换」时回写仪器序列号并置为在用（更换完成后回写仪器序列号并归档旧记录）。
+ * 流转到「已更换」时把新序列号回写安装位（安装位留着、序列号落到新的一台），
+ * 原设备置为停用；新序列号在计量站台账不存在时安装位挂「待认」。
  */
 export const transitionReplace = createAsyncThunk(
   'calibration/transitionReplace',
-  async (
-    payload: { id: string; next: ReplaceState },
-    { rejectWithValue }
-  ) => {
+  async (payload: { id: string; next: ReplaceState }, { rejectWithValue }) => {
     const replace = await db.replaces.get(payload.id);
     if (!replace) return rejectWithValue('更换记录不存在');
     if (!canTransition(replace.state, payload.next)) {
       return rejectWithValue(`状态机不允许从「${replace.state}」流转到「${payload.next}」`);
     }
     const now = Date.now();
-    await db.transaction('rw', [db.replaces, db.instruments], async () => {
+    await db.transaction('rw', [db.replaces, db.installations, db.instruments], async () => {
       await db.replaces.update(payload.id, { state: payload.next, updatedAt: now } as never);
       if (payload.next === '已更换' && replace.newSerialNo) {
-        await db.instruments.update(replace.instrumentId, {
+        const newDevice = await db.instruments.where('serialNo').equals(replace.newSerialNo).first();
+        const syncStatus = newDevice ? '已认' : '待认';
+        await db.installations.update(replace.installationId, {
           serialNo: replace.newSerialNo,
-          state: '在用',
+          syncStatus,
           updatedAt: now,
         } as never);
+        if (replace.oldSerialNo) {
+          const oldDevice = await db.instruments.where('serialNo').equals(replace.oldSerialNo).first();
+          if (oldDevice) {
+            await db.instruments.update(oldDevice.id, { state: '已停用', updatedAt: now } as never);
+          }
+        }
       }
     });
     return payload;
@@ -211,7 +235,7 @@ const calibrationSlice = createSlice({
       .addCase(transitionReplace.fulfilled, (state, action) => {
         state.lastReceipt =
           action.payload.next === '已更换'
-            ? '更换完成：已回写仪器序列号并置为在用，旧记录已归档'
+            ? '更换完成：安装位保留，新序列号已落到新设备，原设备历次标定随原序列号保留'
             : `更换记录状态已流转到「${action.payload.next}」`;
       })
       .addCase(transitionReplace.rejected, (state, action) => {
@@ -274,12 +298,12 @@ export const selectCalibrationsOfInstrument = (
     .sort((a, b) => b.date.localeCompare(a.date));
 };
 
-export const selectReplacesOfInstrument = (
+export const selectReplacesOfInstallation = (
   state: WithCalibration,
-  instrumentId: string | null | undefined
+  installationId: string | null | undefined
 ): Replace[] => {
-  if (!instrumentId) return [];
-  return state.calibration.replaces.filter((row) => row.instrumentId === instrumentId);
+  if (!installationId) return [];
+  return state.calibration.replaces.filter((row) => row.installationId === installationId);
 };
 
 /** 标定 id → 灵敏度变化（相对同仪器上一次标定） */

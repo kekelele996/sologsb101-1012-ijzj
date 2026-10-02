@@ -33,7 +33,7 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import { ROUTES } from '@/router';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstruments, selectInstallations } from '@/stores/instrumentSlice';
 import {
   createReplace,
   patchReplaceFilter,
@@ -57,7 +57,7 @@ import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
 
 interface ReplaceFormValues {
-  instrumentId: string;
+  installationId: string;
   reason: string;
   newSerialNo: string;
   date: dayjs.Dayjs | null;
@@ -69,6 +69,7 @@ interface ReplaceFormValues {
 /** 仪器评定行：标定结论、待标定天数与更换状态 */
 interface AssessmentRow {
   instrument: Instrument;
+  installationId: string | null;
   stationCode: string;
   arrayId: string;
   arrayName: string;
@@ -86,6 +87,7 @@ export default function ReplaceBoard() {
   const { message } = AntdApp.useApp();
 
   const instruments = useAppSelector(selectInstruments);
+  const installations = useAppSelector(selectInstallations);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
   const calibrations = useAppSelector(selectCalibrations);
@@ -102,27 +104,29 @@ export default function ReplaceBoard() {
     if (arrays.length === 0) void initDatabase();
   }, [arrays.length]);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  /** 仪器评定行：结合标定结论与更换记录（物理仪器通过序列号对齐安装位） */
   const rows = useMemo<AssessmentRow[]>(() => {
     return instruments
       .map((instrument) => {
-        const station = stations.find((row) => row.id === instrument.stationId);
+        const installation = installations.find((row) => row.serialNo === instrument.serialNo);
+        const station = installation ? stations.find((row) => row.id === installation.stationId) : undefined;
         const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
         const own = calibrations
           .filter((row) => row.instrumentId === instrument.id)
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = own[0];
-        const lastDate = latest ? latest.date : instrument.installDate;
-        const dueInDays = daysUntilDue(lastDate, instrument.installDate);
+        const lastDate = latest ? latest.date : instrument.qualifyExpiryDate;
+        const dueInDays = daysUntilDue(lastDate, instrument.qualifyExpiryDate);
         const replace =
           replaces
-            .filter((row) => row.instrumentId === instrument.id)
+            .filter((row) => row.installationId === installation?.id)
             .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
         return {
           instrument,
-          stationCode: station?.code ?? '未知台站',
+          installationId: installation?.id ?? null,
+          stationCode: station?.code ?? '未在位数',
           arrayId: array?.id ?? '',
-          arrayName: array?.name ?? '未知台阵',
+          arrayName: array?.name ?? '—',
           lastDate,
           dueInDays,
           overdue: dueInDays < 0,
@@ -145,7 +149,7 @@ export default function ReplaceBoard() {
         return true;
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, filter, instruments, replaces, stations]);
+  }, [arrays, calibrations, filter, installations, instruments, replaces, stations]);
 
   const totals = useMemo(() => {
     const overdue = rows.filter((row) => row.overdue).length;
@@ -161,13 +165,16 @@ export default function ReplaceBoard() {
     () =>
       replaces
         .map((row) => {
-          const instrument = instruments.find((item) => item.id === row.instrumentId);
-          const station = instrument ? stations.find((item) => item.id === instrument.stationId) : undefined;
+          const installation = installations.find((item) => item.id === row.installationId);
+          const instrument = installation
+            ? instruments.find((item) => item.serialNo === installation.serialNo)
+            : undefined;
+          const station = installation ? stations.find((item) => item.id === installation.stationId) : undefined;
           const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
           return { row, instrument, stationCode: station?.code ?? '—', arrayName: array?.name ?? '—' };
         })
         .sort((a, b) => b.row.date.localeCompare(a.row.date)),
-    [arrays, instruments, replaces, stations]
+    [arrays, installations, instruments, replaces, stations]
   );
 
   const filterModel: FilterModel = {
@@ -176,11 +183,11 @@ export default function ReplaceBoard() {
     arrayIds: filter.arrayIds,
   };
 
-  const openCreate = (instrumentId?: string) => {
+  const openCreate = (installationId?: string) => {
     setEditingId(null);
     const defaultReason = REPLACE_REASON_TEMPLATES[0].reason;
     form.setFieldsValue({
-      instrumentId: instrumentId ?? instruments[0]?.id ?? '',
+      installationId: installationId ?? installations[0]?.id ?? '',
       reason: defaultReason,
       newSerialNo: '',
       date: dayjs(),
@@ -194,7 +201,7 @@ export default function ReplaceBoard() {
   const openEdit = (row: Replace) => {
     setEditingId(row.id);
     form.setFieldsValue({
-      instrumentId: row.instrumentId,
+      installationId: row.installationId,
       reason: row.reason,
       newSerialNo: row.newSerialNo,
       date: dayjs(row.date),
@@ -209,9 +216,11 @@ export default function ReplaceBoard() {
     const values = await form.validateFields();
     setSubmitting(true);
     try {
+      const installation = installations.find((item) => item.id === values.installationId);
       const payload = {
-        instrumentId: values.instrumentId,
+        installationId: values.installationId,
         reason: values.reason.trim(),
+        oldSerialNo: installation?.serialNo ?? '',
         newSerialNo: values.newSerialNo.trim(),
         date: values.date ? values.date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
         state: values.state,
@@ -423,7 +432,12 @@ export default function ReplaceBoard() {
               width: 260,
               render: (_: unknown, row: AssessmentRow) => (
                 <Space size={6}>
-                  <Button size="small" type="primary" onClick={() => openCreate(row.instrument.id)}>
+                  <Button
+                    size="small"
+                    type="primary"
+                    onClick={() => openCreate(row.installationId ?? undefined)}
+                    disabled={!row.installationId}
+                  >
                     登记更换
                   </Button>
                   {row.replace ? (
@@ -551,15 +565,16 @@ export default function ReplaceBoard() {
         destroyOnClose
       >
         <Form form={form} layout="vertical" preserve={false}>
-          <Form.Item name="instrumentId" label="被更换仪器" rules={[{ required: true, message: '请选择仪器' }]}>
+          <Form.Item name="installationId" label="被更换安装位" rules={[{ required: true, message: '请选择安装位' }]}>
             <Select
               showSearch
               optionFilterProp="label"
-              options={instruments.map((instrument) => {
-                const station = stations.find((row) => row.id === instrument.stationId);
+              options={installations.map((installation) => {
+                const station = stations.find((row) => row.id === installation.stationId);
+                const device = instruments.find((row) => row.serialNo === installation.serialNo);
                 return {
-                  label: `${station?.code ?? ''} · ${instrument.model}（${instrument.serialNo}）`,
-                  value: instrument.id,
+                  label: `${station?.code ?? ''} · ${installation.channel}（当前 ${installation.serialNo}${device ? ` · ${device.model}` : ''}）`,
+                  value: installation.id,
                 };
               })}
             />

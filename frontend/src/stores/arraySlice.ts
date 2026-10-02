@@ -60,24 +60,17 @@ export const updateArray = createAsyncThunk(
   }
 );
 
-/** 删除台阵：级联删除台站、仪器、标定与更换记录 */
+/** 删除台阵：级联删除台站、安装位、在位数仪器、标定与更换记录 */
 export const removeArray = createAsyncThunk('array/removeArray', async (arrayId: string) => {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.installations, db.calibrations, db.replaces],
     async () => {
       const stationIds = (await db.stations.where('arrayId').equals(arrayId).toArray()).map(
         (row) => row.id
       );
       if (stationIds.length > 0) {
-        const instrumentIds = (
-          await db.instruments.where('stationId').anyOf(stationIds).toArray()
-        ).map((row) => row.id);
-        if (instrumentIds.length > 0) {
-          await db.calibrations.where('instrumentId').anyOf(instrumentIds).delete();
-          await db.replaces.where('instrumentId').anyOf(instrumentIds).delete();
-          await db.instruments.bulkDelete(instrumentIds);
-        }
+        await cascadeDeleteStations(stationIds);
         await db.stations.bulkDelete(stationIds);
       }
       await db.arrays.delete(arrayId);
@@ -104,21 +97,41 @@ export const updateStation = createAsyncThunk(
   }
 );
 
-/** 删除台站：级联删除仪器、标定与更换记录 */
+/** 删除台站：级联删除安装位、在位数仪器、标定与更换记录 */
 export const removeStation = createAsyncThunk('array/removeStation', async (stationId: string) => {
-  await db.transaction('rw', [db.stations, db.instruments, db.calibrations, db.replaces], async () => {
-    const instrumentIds = (
-      await db.instruments.where('stationId').equals(stationId).toArray()
-    ).map((row) => row.id);
-    if (instrumentIds.length > 0) {
-      await db.calibrations.where('instrumentId').anyOf(instrumentIds).delete();
-      await db.replaces.where('instrumentId').anyOf(instrumentIds).delete();
-      await db.instruments.bulkDelete(instrumentIds);
+  await db.transaction(
+    'rw',
+    [db.stations, db.instruments, db.installations, db.calibrations, db.replaces],
+    async () => {
+      await cascadeDeleteStations([stationId]);
+      await db.stations.delete(stationId);
     }
-    await db.stations.delete(stationId);
-  });
+  );
   return stationId;
 });
+
+/**
+ * 级联删除一组台站的下级数据：
+ * 安装位（运维台账）→ 在位数物理仪器（计量台账）→ 历次标定 → 更换记录。
+ * 换机换下的设备若已不在任何安装位，其历史标定随原序列号保留，不随台站删除。
+ */
+async function cascadeDeleteStations(stationIds: string[]): Promise<void> {
+  const installations = await db.installations.where('stationId').anyOf(stationIds).toArray();
+  const installationIds = installations.map((row) => row.id);
+  const serialNos = Array.from(new Set(installations.map((row) => row.serialNo)));
+  if (installationIds.length > 0) {
+    await db.replaces.where('installationId').anyOf(installationIds).delete();
+    await db.installations.bulkDelete(installationIds);
+  }
+  if (serialNos.length > 0) {
+    const instruments = await db.instruments.where('serialNo').anyOf(serialNos).toArray();
+    const instrumentIds = instruments.map((row) => row.id);
+    if (instrumentIds.length > 0) {
+      await db.calibrations.where('instrumentId').anyOf(instrumentIds).delete();
+      await db.instruments.bulkDelete(instrumentIds);
+    }
+  }
+}
 
 /** 按经纬度重算台阵孔径并回写台阵表 */
 export const recomputeAperture = createAsyncThunk(

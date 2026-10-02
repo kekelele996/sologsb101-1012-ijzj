@@ -32,7 +32,7 @@ import QualifyTag from '@/components/common/QualifyTag';
 import EmptyPanel from '@/components/common/EmptyPanel';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstruments, selectInstallations } from '@/stores/instrumentSlice';
 import {
   bulkSetVerdict,
   createCalibration,
@@ -88,6 +88,7 @@ export default function CalibrationBoard() {
 
   const calibrations = useAppSelector(selectCalibrations);
   const instruments = useAppSelector(selectInstruments);
+  const installations = useAppSelector(selectInstallations);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
   const filter = useAppSelector(selectCalibrationFilter);
@@ -118,19 +119,21 @@ export default function CalibrationBoard() {
       { model: string; type: string; serialNo: string; stationCode: string; arrayName: string; arrayId: string }
     >();
     instruments.forEach((instrument) => {
-      const station = stations.find((row) => row.id === instrument.stationId);
+      // 物理仪器通过序列号与安装位对齐，找到当前所在台站
+      const installation = installations.find((row) => row.serialNo === instrument.serialNo);
+      const station = installation ? stations.find((row) => row.id === installation.stationId) : undefined;
       const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
       map.set(instrument.id, {
         model: instrument.model,
         type: instrument.type,
         serialNo: instrument.serialNo,
-        stationCode: station?.code ?? '未知台站',
-        arrayName: array?.name ?? '未知台阵',
+        stationCode: station?.code ?? '未在位数',
+        arrayName: array?.name ?? '—',
         arrayId: array?.id ?? '',
       });
     });
     return map;
-  }, [arrays, instruments, stations]);
+  }, [arrays, installations, instruments, stations]);
 
   /** 逐仪器排序后的标定序列，用于计算灵敏度变化 */
   const deltaIndex = useMemo(() => {

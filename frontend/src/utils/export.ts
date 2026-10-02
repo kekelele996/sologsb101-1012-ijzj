@@ -1,6 +1,7 @@
 /**
  * 备份导入导出：整库 JSON 快照的组装、校验、下载与导入；
- * 以及按台阵汇总的几何与标定结论生成。
+ * 以及按台阵汇总的几何与标定结论。
+ * 快照包含六张表：arrays / stations / instruments / installations / calibrations / replaces。
  */
 import {
   db,
@@ -15,17 +16,25 @@ import type { ResponseVerdict } from '@/types/calibration';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'installations',
+  'calibrations',
+  'replaces',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, installations, calibrations, replaces] = await Promise.all([
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
+    db.installations.toArray(),
     db.calibrations.toArray(),
     db.replaces.toArray(),
   ]);
@@ -36,6 +45,7 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     arrays,
     stations,
     instruments,
+    installations,
     calibrations,
     replaces,
   };
@@ -66,6 +76,7 @@ export function validateBackup(input: unknown): {
     arrays: obj.arrays ?? [],
     stations: obj.stations ?? [],
     instruments: obj.instruments ?? [],
+    installations: obj.installations ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
   };
@@ -78,6 +89,7 @@ export function countPayload(payload: BackupPayload): CountMap {
     arrays: payload.arrays.length,
     stations: payload.stations.length,
     instruments: payload.instruments.length,
+    installations: payload.installations.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
   };
@@ -117,11 +129,12 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.installations, db.calibrations, db.replaces],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
+      await db.installations.bulkPut(payload.installations);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
     }
@@ -134,6 +147,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const arrayMap = new Map<string, string>();
   const stationMap = new Map<string, string>();
   const instrumentMap = new Map<string, string>();
+  const installationMap = new Map<string, string>();
 
   const arrays = payload.arrays.map((row) => {
     const id = createId('arr');
@@ -148,6 +162,11 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const instruments = payload.instruments.map((row) => {
     const id = createId('ins');
     instrumentMap.set(row.id, id);
+    return { ...row, id };
+  });
+  const installations = payload.installations.map((row) => {
+    const id = createId('inst');
+    installationMap.set(row.id, id);
     return { ...row, id, stationId: stationMap.get(row.stationId) ?? row.stationId };
   });
   const calibrations = payload.calibrations.map((row) => ({
@@ -158,9 +177,9 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const replaces = payload.replaces.map((row) => ({
     ...row,
     id: createId('rpl'),
-    instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+    installationId: installationMap.get(row.installationId) ?? row.installationId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  return { ...payload, arrays, stations, instruments, installations, calibrations, replaces };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -175,7 +194,10 @@ export interface ArrayGeometrySummary {
   /** 由经纬度实算的孔径（最大台间距） */
   computedApertureKm: number;
   stationCount: number;
+  /** 当前在位数物理仪器台数（按安装位当前那台统计） */
   instrumentCount: number;
+  /** 安装位总数（含待认） */
+  installationCount: number;
   /** 几何中心 */
   center: { lat: number; lng: number } | null;
   /** 最大台间距的两端台站码与方位角 */
@@ -197,12 +219,20 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
   return payload.arrays.map((array) => {
     const stations = payload.stations.filter((station) => station.arrayId === array.id);
     const stationIds = new Set(stations.map((station) => station.id));
-    const instruments = payload.instruments.filter((instrument) => stationIds.has(instrument.stationId));
-    const instrumentIds = new Set(instruments.map((instrument) => instrument.id));
-    const calibrations = payload.calibrations.filter((calibration) =>
-      instrumentIds.has(calibration.instrumentId)
+    // 安装位（运维班组台账）
+    const installations = payload.installations.filter((inst) => stationIds.has(inst.stationId));
+    // 当前在位数物理仪器：安装位已认 + 序列号能对上计量站台账
+    const knownSerials = new Set(payload.instruments.map((ins) => ins.serialNo));
+    const currentDevices = installations
+      .filter((inst) => inst.syncStatus === '已认' && knownSerials.has(inst.serialNo))
+      .map((inst) => payload.instruments.find((ins) => ins.serialNo === inst.serialNo))
+      .filter((ins): ins is (typeof payload.instruments)[number] => Boolean(ins));
+    const instrumentIds = new Set(currentDevices.map((ins) => ins.id));
+    // 合格率按安装位当前那台重算：只统计当前在位数设备的标定
+    const calibrations = payload.calibrations.filter((cal) => instrumentIds.has(cal.instrumentId));
+    const replaces = payload.replaces.filter((rep) =>
+      installations.some((inst) => inst.id === rep.installationId)
     );
-    const replaces = payload.replaces.filter((replace) => instrumentIds.has(replace.instrumentId));
 
     const points = stations.map((station) => ({
       id: station.id,
@@ -220,21 +250,16 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
         : round(distances.reduce((sum, row) => sum + row.km, 0) / distances.length, 3);
 
     const unqualifiedCount = calibrations.filter(
-      (calibration) => calibration.responseVerdict === '不合格'
+      (cal) => cal.responseVerdict === '不合格'
     ).length;
-    const overdueCount = instruments.filter((instrument) => {
-      const rows = calibrations
-        .filter((calibration) => calibration.instrumentId === instrument.id)
-        .sort((a, b) => b.date.localeCompare(a.date));
-      const lastDate = rows.length > 0 ? rows[0].date : instrument.installDate;
-      const lastTime = Date.parse(`${lastDate}T00:00:00`);
-      if (!Number.isFinite(lastTime)) return true;
-      return today - lastTime > 365 * 86400000;
+    const overdueCount = currentDevices.filter((ins) => {
+      const lastTime = Date.parse(`${ins.qualifyExpiryDate}T00:00:00`);
+      return Number.isFinite(lastTime) && lastTime < today;
     }).length;
-    const pendingReplaceCount = replaces.filter((replace) => replace.state !== '已复核').length;
+    const pendingReplaceCount = replaces.filter((rep) => rep.state !== '已复核').length;
 
     const conclusionParts: string[] = [
-      `${stations.length} 个台站、${instruments.length} 台仪器`,
+      `${stations.length} 个台站、${currentDevices.length} 台在位数仪器`,
       `实算孔径 ${computed} km`,
       `累计 ${calibrations.length} 次标定`,
     ];
@@ -251,7 +276,8 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       recordedApertureKm: array.apertureKm,
       computedApertureKm: computed,
       stationCount: stations.length,
-      instrumentCount: instruments.length,
+      instrumentCount: currentDevices.length,
+      installationCount: installations.length,
       center,
       maxPair:
         distances.length === 0

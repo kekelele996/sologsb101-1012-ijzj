@@ -5,7 +5,7 @@
 import { useCallback, useMemo } from 'react';
 import { useSelector } from 'react-redux';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstruments, selectInstallations } from '@/stores/instrumentSlice';
 import { selectCalibrations } from '@/stores/calibrationSlice';
 import { calibrateDueText, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
 import { CALIBRATION_CYCLE_DAYS, daysUntilDue } from '@/types/instrument';
@@ -55,12 +55,15 @@ export function useCalibHistory(): UseCalibHistoryResult {
   const arrays = useSelector(selectArrays);
   const stations = useSelector(selectStations);
   const instruments = useSelector(selectInstruments);
+  const installations = useSelector(selectInstallations);
   const calibrations = useSelector(selectCalibrations);
 
   const histories = useMemo<InstrumentCalibHistory[]>(() => {
     return instruments
       .map((instrument) => {
-        const station = stations.find((item) => item.id === instrument.stationId);
+        // 物理仪器通过序列号对齐安装位，找到当前所在台站
+        const installation = installations.find((item) => item.serialNo === instrument.serialNo);
+        const station = installation ? stations.find((item) => item.id === installation.stationId) : undefined;
         const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
         const rows = calibrations
           .filter((calibration) => calibration.instrumentId === instrument.id)
@@ -68,15 +71,15 @@ export function useCalibHistory(): UseCalibHistoryResult {
         const latest = rows.length > 0 ? rows[0] : null;
         const previous = rows.length > 1 ? rows[1] : null;
         const delta = sensitivityDelta(latest?.sensitivity ?? 0, previous ? previous.sensitivity : null);
-        const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate);
+        const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.qualifyExpiryDate);
         const worstVerdict = rows.reduce<ResponseVerdict>((worst, row) => {
           return VERDICT_ORDER[row.responseVerdict] > VERDICT_ORDER[worst] ? row.responseVerdict : worst;
         }, '合格');
         return {
           instrument,
-          stationCode: station?.code ?? '未知台站',
+          stationCode: station?.code ?? '未在位数',
           arrayId: array?.id ?? station?.arrayId ?? '',
-          arrayName: array?.name ?? '未知台阵',
+          arrayName: array?.name ?? '—',
           calibrations: rows,
           latest,
           delta,
@@ -91,7 +94,7 @@ export function useCalibHistory(): UseCalibHistoryResult {
         };
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, instruments, stations]);
+  }, [arrays, calibrations, installations, instruments, stations]);
 
   const historyOf = useCallback(
     (instrumentId: string): InstrumentCalibHistory | null =>

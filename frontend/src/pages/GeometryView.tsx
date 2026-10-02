@@ -26,7 +26,7 @@ import StatBadge from '@/components/common/StatBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
 import { useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstruments, selectInstallations } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
 import {
   DB_NAME,
@@ -52,7 +52,14 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  installations: 0,
+  calibrations: 0,
+  replaces: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -60,6 +67,7 @@ export default function GeometryView() {
   const arrays = useAppSelector(selectArrays);
   const stations = useAppSelector(selectStations);
   const instruments = useAppSelector(selectInstruments);
+  const installations = useAppSelector(selectInstallations);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
 
@@ -95,7 +103,7 @@ export default function GeometryView() {
     [activeArrayId, stations]
   );
 
-  /** 台阵几何与标定结论汇总 */
+  /** 台阵几何与标定结论汇总（合格率按安装位当前那台重算） */
   const summaries = useMemo(() => {
     const payload: BackupPayload = {
       app: 'gbseisarray',
@@ -104,11 +112,12 @@ export default function GeometryView() {
       arrays,
       stations,
       instruments,
+      installations,
       calibrations,
       replaces,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, installations, instruments, replaces, stations]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -281,7 +290,8 @@ export default function GeometryView() {
       <div className="gb-stats-row">
         <StatBadge label="台阵" value={counts.arrays} suffix="个" tone="primary" />
         <StatBadge label="台站" value={counts.stations} suffix="个" tone="info" />
-        <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
+        <StatBadge label="安装位" value={counts.installations} suffix="个" tone="primary" />
+        <StatBadge label="在位数仪器" value={counts.instruments} suffix="台" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
       </div>
@@ -359,8 +369,8 @@ export default function GeometryView() {
                 </Descriptions.Item>
                 <Descriptions.Item label="管理部门">{activeSummary.department || '未填写'}</Descriptions.Item>
                 <Descriptions.Item label="布设日期">{activeSummary.deployDate}</Descriptions.Item>
-                <Descriptions.Item label="台站数 / 仪器数">
-                  {activeSummary.stationCount} / {activeSummary.instrumentCount}
+                <Descriptions.Item label="台站数 / 安装位 / 在位数仪器">
+                  {activeSummary.stationCount} / {activeSummary.installationCount} / {activeSummary.instrumentCount}
                 </Descriptions.Item>
                 <Descriptions.Item label="登记 / 实算孔径">
                   {activeSummary.recordedApertureKm} km / <b>{activeSummary.computedApertureKm} km</b>
@@ -426,8 +436,8 @@ export default function GeometryView() {
           columns={[
             { title: '台阵', dataIndex: 'arrayName', width: 180 },
             { title: '状态', dataIndex: 'state', width: 90, render: (value: string) => <Tag>{value}</Tag> },
-            { title: '台站 / 仪器', width: 120, align: 'right', render: (_: unknown, row) => (
-              <span className="gb-mono">{row.stationCount} / {row.instrumentCount}</span>
+            { title: '台站 / 安装位', width: 120, align: 'right', render: (_: unknown, row) => (
+              <span className="gb-mono">{row.stationCount} / {row.installationCount}</span>
             ) },
             {
               title: '登记孔径 (km)',
