@@ -1,7 +1,8 @@
 /**
- * 模块 4：/replacements 合格评定与更换提醒
- * 超期未标定仪器高亮、按标定结论登记更换并跟踪状态机到复核闭环。
- * 复用 <StatBadge>、<QualifyTag>。
+ * 合格评定与更换（两侧协作）：
+ * 上方按安装位评估「当前那台」设备的合格到期情况；换机后评估对象自动换成新序列号。
+ * 登记更换并推进 待更换 → 已更换 → 已复核：
+ * 到「已更换」时安装位保留、序列号落到新设备，旧设备标定仍挂旧序列号。
  */
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -33,7 +34,8 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import { ROUTES } from '@/router';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstalls } from '@/stores/installSlice';
+import { selectDevices } from '@/stores/deviceSlice';
 import {
   createReplace,
   patchReplaceFilter,
@@ -52,12 +54,13 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
-import { daysUntilDue, type Instrument } from '@/types/instrument';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
+import { qualifyForInstall } from '@/utils/qualify';
 import { initDatabase } from '@/utils/db';
+import type { Install } from '@/types/install';
 
 interface ReplaceFormValues {
-  instrumentId: string;
+  installId: string;
   reason: string;
   newSerialNo: string;
   date: dayjs.Dayjs | null;
@@ -66,12 +69,15 @@ interface ReplaceFormValues {
   remark: string;
 }
 
-/** 仪器评定行：标定结论、待标定天数与更换状态 */
+/** 安装位评定行 */
 interface AssessmentRow {
-  instrument: Instrument;
+  install: Install;
   stationCode: string;
+  channel: string;
   arrayId: string;
   arrayName: string;
+  model: string;
+  serialNo: string;
   lastDate: string;
   dueInDays: number;
   overdue: boolean;
@@ -85,9 +91,10 @@ export default function ReplaceBoard() {
   const dispatch = useAppDispatch();
   const { message } = AntdApp.useApp();
 
-  const instruments = useAppSelector(selectInstruments);
+  const installs = useAppSelector(selectInstalls);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
+  const devices = useAppSelector(selectDevices);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
   const filter = useAppSelector(selectReplaceFilter);
@@ -100,41 +107,54 @@ export default function ReplaceBoard() {
 
   useEffect(() => {
     if (arrays.length === 0) void initDatabase();
-  }, [arrays.length]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  const deviceBySerial = useMemo(
+    () => new Map(devices.map((device) => [device.serialNo, device])),
+    [devices]
+  );
+
+  /** 每个安装位最新的更换记录 */
+  const latestReplaceByInstall = useMemo(() => {
+    const map = new Map<string, Replace>();
+    replaces
+      .slice()
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .forEach((row) => {
+        if (!map.has(row.installId)) map.set(row.installId, row);
+      });
+    return map;
+  }, [replaces]);
+
+  /** 安装位评定行：只看当前序列号那台设备 */
   const rows = useMemo<AssessmentRow[]>(() => {
-    return instruments
-      .map((instrument) => {
-        const station = stations.find((row) => row.id === instrument.stationId);
+    return installs
+      .map((install) => {
+        const station = stations.find((row) => row.id === install.stationId);
         const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
-        const own = calibrations
-          .filter((row) => row.instrumentId === instrument.id)
-          .sort((a, b) => b.date.localeCompare(a.date));
-        const latest = own[0];
-        const lastDate = latest ? latest.date : instrument.installDate;
-        const dueInDays = daysUntilDue(lastDate, instrument.installDate);
-        const replace =
-          replaces
-            .filter((row) => row.instrumentId === instrument.id)
-            .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
+        const q = qualifyForInstall(install, calibrations);
+        const device = deviceBySerial.get(install.serialNo);
         return {
-          instrument,
+          install,
           stationCode: station?.code ?? '未知台站',
-          arrayId: array?.id ?? '',
+          channel: install.channel,
+          arrayId: array?.id ?? station?.arrayId ?? '',
           arrayName: array?.name ?? '未知台阵',
-          lastDate,
-          dueInDays,
-          overdue: dueInDays < 0,
-          lastVerdict: latest ? latest.responseVerdict : '待判定',
-          calibrationCount: own.length,
-          replace,
+          model: device?.model ?? '（序列号待认领）',
+          serialNo: install.serialNo,
+          lastDate: q.latest?.date ?? install.installDate,
+          dueInDays: q.dueInDays,
+          overdue: q.overdue,
+          lastVerdict: q.verdict,
+          calibrationCount: q.count,
+          replace: latestReplaceByInstall.get(install.id) ?? null,
         };
       })
       .filter((row) => {
         const keyword = filter.keyword.trim();
         if (keyword.length > 0) {
-          const haystack = `${row.instrument.model}${row.instrument.serialNo}${row.stationCode}${row.arrayName}`;
+          const haystack = `${row.model}${row.serialNo}${row.stationCode}${row.channel}${row.arrayName}`;
           if (!haystack.includes(keyword)) return false;
         }
         if (filter.arrayIds.length > 0 && !filter.arrayIds.includes(row.arrayId)) return false;
@@ -145,43 +165,43 @@ export default function ReplaceBoard() {
         return true;
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, filter, instruments, replaces, stations]);
+  }, [arrays, calibrations, deviceBySerial, filter, installs, latestReplaceByInstall, stations]);
 
   const totals = useMemo(() => {
     const overdue = rows.filter((row) => row.overdue).length;
     const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
-    const cycleRate =
-      rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
-    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
+    const cycleRate = rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
+    return { installs: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
   }, [replaces, rows]);
 
+  /** 更换记录跟踪表（带当前台站信息） */
   const replaceRows = useMemo(
     () =>
       replaces
         .map((row) => {
-          const instrument = instruments.find((item) => item.id === row.instrumentId);
-          const station = instrument ? stations.find((item) => item.id === instrument.stationId) : undefined;
+          const install = installs.find((item) => item.id === row.installId);
+          const station = install ? stations.find((item) => item.id === install.stationId) : undefined;
           const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
-          return { row, instrument, stationCode: station?.code ?? '—', arrayName: array?.name ?? '—' };
+          return {
+            row,
+            channel: install?.channel ?? '—',
+            stationCode: station?.code ?? '安装位已删除',
+            arrayName: array?.name ?? '—',
+          };
         })
         .sort((a, b) => b.row.date.localeCompare(a.row.date)),
-    [arrays, instruments, replaces, stations]
+    [arrays, installs, replaces, stations]
   );
 
-  const filterModel: FilterModel = {
-    keyword: filter.keyword,
-    states: filter.states,
-    arrayIds: filter.arrayIds,
-  };
+  const filterModel: FilterModel = { keyword: filter.keyword, states: filter.states, arrayIds: filter.arrayIds };
 
-  const openCreate = (instrumentId?: string) => {
+  const openCreate = (installId?: string) => {
     setEditingId(null);
-    const defaultReason = REPLACE_REASON_TEMPLATES[0].reason;
     form.setFieldsValue({
-      instrumentId: instrumentId ?? instruments[0]?.id ?? '',
-      reason: defaultReason,
+      installId: installId ?? installs[0]?.id ?? '',
+      reason: REPLACE_REASON_TEMPLATES[0].reason,
       newSerialNo: '',
       date: dayjs(),
       state: '待更换',
@@ -194,7 +214,7 @@ export default function ReplaceBoard() {
   const openEdit = (row: Replace) => {
     setEditingId(row.id);
     form.setFieldsValue({
-      instrumentId: row.instrumentId,
+      installId: row.installId,
       reason: row.reason,
       newSerialNo: row.newSerialNo,
       date: dayjs(row.date),
@@ -210,7 +230,7 @@ export default function ReplaceBoard() {
     setSubmitting(true);
     try {
       const payload = {
-        instrumentId: values.instrumentId,
+        installId: values.installId,
         reason: values.reason.trim(),
         newSerialNo: values.newSerialNo.trim(),
         date: values.date ? values.date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
@@ -236,7 +256,7 @@ export default function ReplaceBoard() {
       await dispatch(transitionReplace({ id: row.id, next })).unwrap();
       message.success(
         next === '已更换'
-          ? '更换完成：已回写仪器序列号并置为在用，旧记录已归档'
+          ? '换机完成：安装位保留，序列号已落到新设备；旧设备历次标定仍挂旧序列号'
           : `更换记录状态已流转到「${next}」`
       );
     } catch (error) {
@@ -244,17 +264,7 @@ export default function ReplaceBoard() {
     }
   };
 
-  const handleFilterChange = (next: FilterModel) => {
-    dispatch(
-      patchReplaceFilter({
-        keyword: next.keyword,
-        states: ((next.states as string[]) ?? []) as ReplaceState[],
-        arrayIds: (next.arrayIds as string[]) ?? [],
-      })
-    );
-  };
-
-  /** 超期仪器提醒（标定周期 365 天） */
+  /** 超期安装位提醒 */
   const overdueHistories = histories.filter((history) => history.overdue);
 
   return (
@@ -267,7 +277,8 @@ export default function ReplaceBoard() {
             合格评定与更换提醒
           </Typography.Title>
           <p className="gb-hint">
-            按标定周期（365 天）与脉冲响应结论评定仪器是否合格；超期未标定与不合格仪器高亮提示，可直接登记更换并跟踪到复核闭环。
+            按安装位当前设备的合格到期日（标定周期 365 天）与最近结论评定；换机后安装位保留、序列号落到新设备，
+            评定自动跟着新序列号重算。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => openCreate()}>
@@ -276,20 +287,10 @@ export default function ReplaceBoard() {
       </div>
 
       <div className="gb-stats-row">
-        <StatBadge label="仪器台数" value={totals.instruments} suffix="台" tone="primary" />
-        <StatBadge
-          label="超期未标定"
-          value={totals.overdue}
-          suffix="台"
-          tone={totals.overdue > 0 ? 'danger' : 'success'}
-        />
-        <StatBadge
-          label="结论不合格"
-          value={totals.unqualified}
-          suffix="台"
-          tone={totals.unqualified > 0 ? 'warning' : 'success'}
-        />
-        <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
+        <StatBadge label="安装位" value={totals.installs} suffix="个" tone="primary" />
+        <StatBadge label="超期未标定" value={totals.overdue} suffix="个" tone={totals.overdue > 0 ? 'danger' : 'success'} />
+        <StatBadge label="当前设备不合格" value={totals.unqualified} suffix="个" tone={totals.unqualified > 0 ? 'warning' : 'success'} />
+        <StatBadge label="按期率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
         <StatBadge label="已复核" value={totals.closedReplace} suffix="条" tone="info" />
       </div>
@@ -299,80 +300,78 @@ export default function ReplaceBoard() {
           type="warning"
           showIcon
           icon={<WarningFilled />}
-          message={`存在 ${overdueHistories.length} 台超期未标定仪器，请优先安排标定或登记更换`}
+          message={`存在 ${overdueHistories.length} 台在装设备合格到期未标定，请优先安排标定或登记更换`}
           description={overdueHistories
             .slice(0, 5)
             .map(
               (history) =>
-                `${history.arrayName} / ${history.stationCode} · ${history.instrument.model}（${history.instrument.serialNo}）已超期 ${Math.abs(history.dueInDays)} 天`
+                `${history.arrayName} / ${history.stationCode} · ${history.device.model}（${history.device.serialNo}）已超期 ${Math.abs(history.dueInDays)} 天`
             )
             .join('；')}
         />
       ) : (
-        <Alert type="success" showIcon message="全部仪器均在标定周期内，无需特别提醒" />
+        <Alert type="success" showIcon message="全部在装设备均在标定周期内，无需特别提醒" />
       )}
 
       <FilterBar
         modelValue={filterModel}
         selects={[
-          {
-            key: 'states',
-            label: '更换状态',
-            options: REPLACE_STATES.map((state) => ({ label: state, value: state })),
-          },
-          {
-            key: 'arrayIds',
-            label: '所属台阵',
-            options: arrays.map((array) => ({ label: array.name, value: array.id })),
-          },
+          { key: 'states', label: '更换状态', options: REPLACE_STATES.map((state) => ({ label: state, value: state })) },
+          { key: 'arrayIds', label: '所属台阵', options: arrays.map((array) => ({ label: array.name, value: array.id })) },
         ]}
-        keywordPlaceholder="搜索型号 / 序列号 / 台站 / 台阵"
-        onChange={handleFilterChange}
+        keywordPlaceholder="搜索型号 / 序列号 / 台站 / 通道"
+        onChange={(next) =>
+          dispatch(
+            patchReplaceFilter({
+              keyword: next.keyword,
+              states: ((next.states as string[]) ?? []) as ReplaceState[],
+              arrayIds: (next.arrayIds as string[]) ?? [],
+            })
+          )
+        }
         onReset={() => dispatch(resetReplaceFilter())}
       />
 
       {rows.length === 0 ? (
         <EmptyPanel
-          title={instruments.length === 0 ? '还没有仪器' : '没有符合条件的仪器'}
-          description="先到「台站仪器」页登记仪器并录入标定结果，再回到本页进行合格评定与更换跟踪。"
+          title={installs.length === 0 ? '还没有安装位' : '没有符合条件的安装位'}
+          description="先到「台站安装位」页登记通道与序列号，再回本页评定与登记更换。"
           actionText="登记更换"
-          secondaryText="重置筛选"
+          secondaryText="去安装位"
           onAction={() => openCreate()}
-          onSecondary={() => dispatch(resetReplaceFilter())}
+          onSecondary={() => navigate(ROUTES.arrays)}
         />
       ) : (
         <Table
-          rowKey={(row) => row.instrument.id}
+          rowKey={(row) => row.install.id}
           className="gb-table-compact"
           dataSource={rows}
           pagination={{ pageSize: 10, showSizeChanger: false }}
           rowClassName={(row) => (row.overdue || row.lastVerdict === '不合格' ? 'gb-row-danger' : '')}
           columns={[
             {
-              title: '仪器',
-              width: 210,
+              title: '台站 / 通道',
+              width: 160,
               render: (_: unknown, row: AssessmentRow) => (
                 <div>
-                  <div>
-                    {row.instrument.model} <Tag>{row.instrument.type}</Tag>
-                  </div>
-                  <div className="gb-hint gb-mono">{row.instrument.serialNo}</div>
+                  <div className="gb-mono">{row.stationCode}</div>
+                  <Tag color="blue">{row.channel}</Tag>
                 </div>
               ),
             },
             {
-              title: '台站 / 台阵',
-              width: 180,
+              title: '当前设备',
+              width: 230,
               render: (_: unknown, row: AssessmentRow) => (
                 <div>
-                  <div className="gb-mono">{row.stationCode}</div>
-                  <div className="gb-hint">{row.arrayName}</div>
+                  <div>{row.model}</div>
+                  <div className="gb-hint gb-mono">{row.serialNo}</div>
                 </div>
               ),
             },
             {
               title: '最近标定',
-              width: 130,
+              width: 120,
               render: (_: unknown, row: AssessmentRow) => (
                 <div>
                   <div className="gb-mono">{row.lastDate}</div>
@@ -381,7 +380,7 @@ export default function ReplaceBoard() {
               ),
             },
             {
-              title: '标定提醒',
+              title: '合格到期',
               width: 160,
               render: (_: unknown, row: AssessmentRow) => (
                 <span className={row.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>
@@ -390,16 +389,16 @@ export default function ReplaceBoard() {
               ),
             },
             {
-              title: '标定结论',
-              width: 150,
+              title: '最近结论',
+              width: 140,
               render: (_: unknown, row: AssessmentRow) => <QualifyTag verdict={row.lastVerdict as never} size="small" />,
             },
             {
-              title: '仪器状态',
+              title: '安装位状态',
               width: 110,
               render: (_: unknown, row: AssessmentRow) => (
-                <Tag color={row.instrument.state === '在用' ? 'green' : row.instrument.state === '待标定' ? 'orange' : 'default'}>
-                  {row.instrument.state}
+                <Tag color={row.install.state === '在用' ? 'green' : row.install.state === '待标定' ? 'orange' : 'default'}>
+                  {row.install.state}
                 </Tag>
               ),
             },
@@ -420,10 +419,10 @@ export default function ReplaceBoard() {
             },
             {
               title: '操作',
-              width: 260,
+              width: 250,
               render: (_: unknown, row: AssessmentRow) => (
                 <Space size={6}>
-                  <Button size="small" type="primary" onClick={() => openCreate(row.instrument.id)}>
+                  <Button size="small" type="primary" onClick={() => openCreate(row.install.id)}>
                     登记更换
                   </Button>
                   {row.replace ? (
@@ -449,7 +448,7 @@ export default function ReplaceBoard() {
         {replaceRows.length === 0 ? (
           <EmptyPanel
             title="还没有更换记录"
-            description="对超期或不合格仪器点击「登记更换」，即可跟踪到复核闭环。"
+            description="对超期或不合格安装位点「登记更换」，换机后序列号落到新设备、安装位保留。"
             actionText="登记更换"
             onAction={() => openCreate()}
             compact
@@ -463,37 +462,38 @@ export default function ReplaceBoard() {
             pagination={false}
             columns={[
               {
-                title: '仪器',
-                width: 200,
+                title: '安装位 / 通道',
+                width: 150,
                 render: (_: unknown, item) => (
                   <div>
-                    <div>{item.instrument?.model ?? '仪器已删除'}</div>
-                    <div className="gb-hint gb-mono">{item.row.newSerialNo || '未填新序列号'}</div>
+                    <div className="gb-mono">{item.stationCode}</div>
+                    <Tag color="blue">{item.channel}</Tag>
                   </div>
                 ),
               },
               {
-                title: '台站 / 台阵',
-                width: 160,
+                title: '旧序列号 → 新序列号',
+                width: 300,
                 render: (_: unknown, item) => (
-                  <div>
-                    <div className="gb-mono">{item.stationCode}</div>
-                    <div className="gb-hint">{item.arrayName}</div>
+                  <div className="gb-mono">
+                    <span>{item.row.fromSerialNo || '—'}</span>
+                    <span style={{ margin: '0 6px' }}>→</span>
+                    <b>{item.row.newSerialNo || '未填新序列号'}</b>
                   </div>
                 ),
               },
               { title: '更换原因', dataIndex: ['row', 'reason'], ellipsis: true },
-              { title: '日期', dataIndex: ['row', 'date'], width: 120, className: 'gb-mono' },
+              { title: '日期', dataIndex: ['row', 'date'], width: 110, className: 'gb-mono' },
               {
                 title: '状态',
-                width: 130,
+                width: 110,
                 render: (_: unknown, item) => (
                   <Tag color={item.row.state === '已复核' ? 'green' : item.row.state === '已更换' ? 'blue' : 'orange'}>
                     {item.row.state}
                   </Tag>
                 ),
               },
-              { title: '责任人', dataIndex: ['row', 'operator'], width: 100 },
+              { title: '责任人', dataIndex: ['row', 'operator'], width: 90 },
               {
                 title: '操作',
                 width: 280,
@@ -509,7 +509,7 @@ export default function ReplaceBoard() {
                     </Button>
                     <Popconfirm
                       title="删除更换记录"
-                      description="确认删除该更换记录？"
+                      description="仅删除流转记录；已认过的序列号归属不退回，确认？"
                       okText="删除"
                       cancelText="取消"
                       okButtonProps={{ danger: true }}
@@ -532,12 +532,12 @@ export default function ReplaceBoard() {
       </Card>
 
       <p className="gb-hint">
-        更换完成后点击「→ 已更换」，系统会把新序列号回写到仪器档案并置为在用；再流转到「已复核」即完成闭环。
-        前往
-        <Button type="link" size="small" onClick={() => navigate(ROUTES.calibrations)}>
-          标定记录台
+        点「→ 已更换」后安装位保留、序列号落到新设备并按新机日重算到期；旧序列号的历次标定不带走。
+        新序列号若计量站尚无档案，会自动进
+        <Button type="link" size="small" onClick={() => navigate(ROUTES.claims)}>
+          序列号对账
         </Button>
-        可查看历次灵敏度趋势。
+        待认领。
       </p>
 
       <Modal
@@ -551,15 +551,16 @@ export default function ReplaceBoard() {
         destroyOnClose
       >
         <Form form={form} layout="vertical" preserve={false}>
-          <Form.Item name="instrumentId" label="被更换仪器" rules={[{ required: true, message: '请选择仪器' }]}>
+          <Form.Item name="installId" label="发生更换的安装位" rules={[{ required: true, message: '请选择安装位' }]}>
             <Select
               showSearch
               optionFilterProp="label"
-              options={instruments.map((instrument) => {
-                const station = stations.find((row) => row.id === instrument.stationId);
+              disabled={!!editingId}
+              options={installs.map((install) => {
+                const station = stations.find((row) => row.id === install.stationId);
                 return {
-                  label: `${station?.code ?? ''} · ${instrument.model}（${instrument.serialNo}）`,
-                  value: instrument.id,
+                  label: `${station?.code ?? '未知台站'} · ${install.channel} · 当前 ${install.serialNo}`,
+                  value: install.id,
                 };
               })}
             />
@@ -577,7 +578,7 @@ export default function ReplaceBoard() {
           </Space>
           <Row gutter={12}>
             <Col span={12}>
-              <Form.Item name="newSerialNo" label="新序列号" rules={[{ required: true, message: '请填写新序列号' }]}>
+              <Form.Item name="newSerialNo" label="新序列号（换机后落到该安装位）" rules={[{ required: true, message: '请填写新序列号' }]}>
                 <Input maxLength={60} placeholder="如：CMG-3E-20250410-33" />
               </Form.Item>
             </Col>

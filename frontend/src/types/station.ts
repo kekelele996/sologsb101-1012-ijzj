@@ -24,7 +24,7 @@ export interface SeisStation {
   updatedAt: number;
 }
 
-/** 台站列表页筛选条件（存于 instrumentSlice） */
+/** 台站列表页筛选条件（存于 arraySlice） */
 export interface StationFilterState {
   keyword: string;
   bedrocks: BedrockType[];

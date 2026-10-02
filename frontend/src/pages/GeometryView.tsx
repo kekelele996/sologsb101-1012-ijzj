@@ -26,8 +26,9 @@ import StatBadge from '@/components/common/StatBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
 import { useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
-import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectInstalls } from '@/stores/installSlice';
+import { selectDevices } from '@/stores/deviceSlice';
+import { selectCalibrations, selectClaims, selectOutbox, selectReplaces } from '@/stores/calibrationSlice';
 import {
   DB_NAME,
   DB_VERSION,
@@ -52,16 +53,28 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  installs: 0,
+  devices: 0,
+  calibrations: 0,
+  replaces: 0,
+  claims: 0,
+  outbox: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
 
   const arrays = useAppSelector(selectArrays);
   const stations = useAppSelector(selectStations);
-  const instruments = useAppSelector(selectInstruments);
+  const installs = useAppSelector(selectInstalls);
+  const devices = useAppSelector(selectDevices);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const claims = useAppSelector(selectClaims);
+  const outbox = useAppSelector(selectOutbox);
 
   const [selectedArrayId, setSelectedArrayId] = useState<string | null>(null);
   const [counts, setCounts] = useState<CountMap>(EMPTY_COUNTS);
@@ -86,7 +99,7 @@ export default function GeometryView() {
   useEffect(() => {
     void refresh();
     // 数据变化后刷新统计
-  }, [arrays, stations, instruments, calibrations, replaces]);
+  }, [arrays, stations, installs, devices, calibrations, replaces, claims, outbox]);
 
   const activeArrayId = selectedArrayId ?? arrays[0]?.id ?? null;
   const activeArray = arrays.find((row) => row.id === activeArrayId) ?? null;
@@ -103,12 +116,15 @@ export default function GeometryView() {
       exportedAt: new Date().toISOString(),
       arrays,
       stations,
-      instruments,
+      installs,
+      devices,
       calibrations,
       replaces,
+      claims,
+      outbox,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, claims, devices, installs, outbox, replaces, stations]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -215,7 +231,7 @@ export default function GeometryView() {
 
   const handleReset = async (): Promise<void> => {
     const confirmed = window.confirm(
-      '将清空全部本地数据并重新播种演示数据（台阵、台站、仪器、标定、更换）。确认继续？'
+      '将清空全部本地数据并重新播种演示数据（台阵、台站、安装位、物理仪器、标定、更换、挂账）。确认继续？'
     );
     if (!confirmed) return;
     setBusy(true);
@@ -233,7 +249,7 @@ export default function GeometryView() {
     const text = summaries
       .map(
         (row) =>
-          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台，登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
+          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，安装位 ${row.installCount} 个，登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，当前设备标定 ${row.calibrationCount} 次、合格率 ${row.qualifyRate}%，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 个，未闭环更换 ${row.pendingReplaceCount} 条，待认领 ${row.pendingClaimCount} 个。`
       )
       .join('\n');
     try {
@@ -281,9 +297,11 @@ export default function GeometryView() {
       <div className="gb-stats-row">
         <StatBadge label="台阵" value={counts.arrays} suffix="个" tone="primary" />
         <StatBadge label="台站" value={counts.stations} suffix="个" tone="info" />
-        <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
+        <StatBadge label="安装位" value={counts.installs} suffix="个" tone="default" />
+        <StatBadge label="物理仪器" value={counts.devices} suffix="台" tone="info" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
+        <StatBadge label="挂账 / 同步" value={`${counts.claims}/${counts.outbox}`} suffix="条" tone="danger" />
       </div>
 
       {!activeArray || !activeSummary ? (
@@ -359,8 +377,8 @@ export default function GeometryView() {
                 </Descriptions.Item>
                 <Descriptions.Item label="管理部门">{activeSummary.department || '未填写'}</Descriptions.Item>
                 <Descriptions.Item label="布设日期">{activeSummary.deployDate}</Descriptions.Item>
-                <Descriptions.Item label="台站数 / 仪器数">
-                  {activeSummary.stationCount} / {activeSummary.instrumentCount}
+                <Descriptions.Item label="台站数 / 安装位">
+                  {activeSummary.stationCount} / {activeSummary.installCount}
                 </Descriptions.Item>
                 <Descriptions.Item label="登记 / 实算孔径">
                   {activeSummary.recordedApertureKm} km / <b>{activeSummary.computedApertureKm} km</b>
@@ -379,14 +397,17 @@ export default function GeometryView() {
                       )}° 方位至首站）`
                     : '—'}
                 </Descriptions.Item>
-                <Descriptions.Item label="累计标定 / 不合格">
-                  {activeSummary.calibrationCount} 次 /{' '}
-                  <span className={activeSummary.unqualifiedCount > 0 ? 'gb-danger' : ''}>
-                    {activeSummary.unqualifiedCount} 次
-                  </span>
+                <Descriptions.Item label="当前设备标定 / 合格率">
+                  {activeSummary.calibrationCount} 次 / <b>{activeSummary.qualifyRate}%</b>
+                  {activeSummary.unqualifiedCount > 0 ? (
+                    <>
+                      {' '}· <span className="gb-danger">不合格 {activeSummary.unqualifiedCount}</span>
+                    </>
+                  ) : null}
                 </Descriptions.Item>
-                <Descriptions.Item label="超期未标定 / 未闭环更换">
-                  {activeSummary.overdueCount} 台 / {activeSummary.pendingReplaceCount} 条
+                <Descriptions.Item label="超期 / 待认领 / 未闭环">
+                  {activeSummary.overdueCount} 个 / {activeSummary.pendingClaimCount} 个 /{' '}
+                  {activeSummary.pendingReplaceCount} 条
                 </Descriptions.Item>
                 <Descriptions.Item label="结论">{activeSummary.conclusion}</Descriptions.Item>
               </Descriptions>
@@ -426,8 +447,8 @@ export default function GeometryView() {
           columns={[
             { title: '台阵', dataIndex: 'arrayName', width: 180 },
             { title: '状态', dataIndex: 'state', width: 90, render: (value: string) => <Tag>{value}</Tag> },
-            { title: '台站 / 仪器', width: 120, align: 'right', render: (_: unknown, row) => (
-              <span className="gb-mono">{row.stationCount} / {row.instrumentCount}</span>
+            { title: '台站 / 安装位', width: 120, align: 'right', render: (_: unknown, row) => (
+              <span className="gb-mono">{row.stationCount} / {row.installCount}</span>
             ) },
             {
               title: '登记孔径 (km)',
@@ -449,18 +470,25 @@ export default function GeometryView() {
               align: 'right',
               className: 'gb-mono',
             },
-            { title: '累计标定', dataIndex: 'calibrationCount', width: 100, align: 'right', className: 'gb-mono' },
+            { title: '当前标定', dataIndex: 'calibrationCount', width: 90, align: 'right', className: 'gb-mono' },
+            {
+              title: '合格率',
+              dataIndex: 'qualifyRate',
+              width: 90,
+              align: 'right',
+              render: (value: number) => <b className="gb-mono">{value}%</b>,
+            },
             {
               title: '不合格',
               dataIndex: 'unqualifiedCount',
-              width: 90,
+              width: 80,
               align: 'right',
               render: (value: number) => <span className={value > 0 ? 'gb-danger gb-mono' : 'gb-mono'}>{value}</span>,
             },
             {
-              title: '超期台数',
+              title: '超期位数',
               dataIndex: 'overdueCount',
-              width: 100,
+              width: 90,
               align: 'right',
               render: (value: number) => <span className={value > 0 ? 'gb-danger gb-mono' : 'gb-mono'}>{value}</span>,
             },
@@ -503,15 +531,16 @@ export default function GeometryView() {
             <Descriptions.Item label="结构版本">v{DB_VERSION}</Descriptions.Item>
             <Descriptions.Item label="浏览器记录版本">v{stampedVersion}</Descriptions.Item>
             <Descriptions.Item label="台阵 / 台站">{counts.arrays} / {counts.stations}</Descriptions.Item>
-            <Descriptions.Item label="仪器 / 标定">{counts.instruments} / {counts.calibrations}</Descriptions.Item>
-            <Descriptions.Item label="更换记录">{counts.replaces}</Descriptions.Item>
+            <Descriptions.Item label="安装位 / 仪器">{counts.installs} / {counts.devices}</Descriptions.Item>
+            <Descriptions.Item label="标定 / 更换">{counts.calibrations} / {counts.replaces}</Descriptions.Item>
+            <Descriptions.Item label="挂账 / 同步事件">{counts.claims} / {counts.outbox}</Descriptions.Item>
             <Descriptions.Item label="最近备份时间" span={3}>
               {lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}
             </Descriptions.Item>
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含 arrays / stations / installs / devices / calibrations / replaces / claims / outbox 八张表。
           </p>
         </Space>
       </Card>

@@ -1,89 +1,92 @@
 /**
- * useCalibHistory：按仪器聚合历次标定、算灵敏度变化量与待标定天数。
+ * useCalibHistory：按物理仪器序列号聚合历次标定、算灵敏度变化量与合格到期天数。
+ * 台站 / 台阵经「当前装在哪个安装位」取得；换机后历史只跟序列号走，不跟安装位。
  * 被标定记录台（/calibrations）与更换提醒页（/replacements）消费。
  */
 import { useCallback, useMemo } from 'react';
 import { useSelector } from 'react-redux';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstalls } from '@/stores/installSlice';
+import { selectDevices } from '@/stores/deviceSlice';
 import { selectCalibrations } from '@/stores/calibrationSlice';
 import { calibrateDueText, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
-import { CALIBRATION_CYCLE_DAYS, daysUntilDue } from '@/types/instrument';
+import { CALIBRATION_CYCLE_DAYS, daysUntilDue, plusCycle, type Device } from '@/types/device';
 import type { Calibration, ResponseVerdict } from '@/types/calibration';
-import type { Instrument } from '@/types/instrument';
 
-/** 单台仪器的标定历史聚合 */
-export interface InstrumentCalibHistory {
-  instrument: Instrument;
+/** 单台物理仪器的标定历史聚合 */
+export interface DeviceCalibHistory {
+  device: Device;
+  /** 当前安装位 id（可能为空：库存/已拆下） */
+  installId: string | null;
   stationCode: string;
   arrayId: string;
   arrayName: string;
   /** 历次标定（按日期降序） */
   calibrations: Calibration[];
-  /** 最近一次标定 */
   latest: Calibration | null;
-  /** 最近一次灵敏度相对上一次的变化 */
   delta: SensitivityDelta;
-  /** 标定次数 */
   count: number;
-  /** 距下次标定天数（负数为已超期） */
+  /** 距合格到期天数（负数为已超期） */
   dueInDays: number;
-  /** 是否超期未标定 */
   overdue: boolean;
-  /** 是否处于待标定状态 */
+  /** 是否待标定：无合格标定、超期或最近一次不合格 */
   pending: boolean;
-  /** 历次结论中最差的一次 */
   worstVerdict: ResponseVerdict;
-  /** 灵敏度序列（由旧到新），供趋势展示 */
   trend: Array<{ date: string; sensitivity: number; selfNoise: number }>;
 }
 
 export interface UseCalibHistoryResult {
-  histories: InstrumentCalibHistory[];
-  historyOf: (instrumentId: string) => InstrumentCalibHistory | null;
-  overdueHistories: InstrumentCalibHistory[];
-  /** 灵敏度趋势：返回指定仪器的序列 */
-  trendOf: (instrumentId: string) => Array<{ date: string; sensitivity: number; selfNoise: number }>;
+  histories: DeviceCalibHistory[];
+  historyOf: (serialNo: string) => DeviceCalibHistory | null;
+  overdueHistories: DeviceCalibHistory[];
+  trendOf: (serialNo: string) => Array<{ date: string; sensitivity: number; selfNoise: number }>;
 }
 
 const VERDICT_ORDER: Record<ResponseVerdict, number> = { 合格: 0, 待判定: 1, 不合格: 2 };
 
-/**
- * 组合式 Hook：基于 Redux 中的台阵 / 台站 / 仪器 / 标定数据派生标定历史与超期提醒。
- */
 export function useCalibHistory(): UseCalibHistoryResult {
   const arrays = useSelector(selectArrays);
   const stations = useSelector(selectStations);
-  const instruments = useSelector(selectInstruments);
+  const installs = useSelector(selectInstalls);
+  const devices = useSelector(selectDevices);
   const calibrations = useSelector(selectCalibrations);
 
-  const histories = useMemo<InstrumentCalibHistory[]>(() => {
-    return instruments
-      .map((instrument) => {
-        const station = stations.find((item) => item.id === instrument.stationId);
+  const histories = useMemo<DeviceCalibHistory[]>(() => {
+    // 序列号 → 当前安装位
+    const installBySerial = new Map(installs.map((install) => [install.serialNo, install]));
+
+    return devices
+      .map((device) => {
+        const install = installBySerial.get(device.serialNo) ?? null;
+        const station = install ? stations.find((item) => item.id === install.stationId) : undefined;
         const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
         const rows = calibrations
-          .filter((calibration) => calibration.instrumentId === instrument.id)
+          .filter((calibration) => calibration.serialNo === device.serialNo)
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = rows.length > 0 ? rows[0] : null;
         const previous = rows.length > 1 ? rows[1] : null;
         const delta = sensitivityDelta(latest?.sensitivity ?? 0, previous ? previous.sensitivity : null);
-        const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate);
+        const latestQualifiedDate = rows.find((row) => row.responseVerdict === '合格')?.date ?? null;
+        const dueDate = plusCycle(latestQualifiedDate);
+        // 基准日：当前安装日期；库存设备没有安装位时取建档兜底（daysUntilDue 内处理）
+        const baseDate = install?.installDate ?? (rows.length > 0 ? rows[rows.length - 1].date : '');
+        const dueInDays = daysUntilDue(latestQualifiedDate, baseDate);
         const worstVerdict = rows.reduce<ResponseVerdict>((worst, row) => {
           return VERDICT_ORDER[row.responseVerdict] > VERDICT_ORDER[worst] ? row.responseVerdict : worst;
         }, '合格');
         return {
-          instrument,
-          stationCode: station?.code ?? '未知台站',
+          device,
+          installId: install?.id ?? null,
+          stationCode: station?.code ?? (install ? '未知台站' : '库存 / 已拆下'),
           arrayId: array?.id ?? station?.arrayId ?? '',
-          arrayName: array?.name ?? '未知台阵',
+          arrayName: array?.name ?? '未安装',
           calibrations: rows,
           latest,
           delta,
           count: rows.length,
           dueInDays,
-          overdue: dueInDays < 0,
-          pending: instrument.state === '待标定' || dueInDays < 0,
+          overdue: dueDate !== null && dueInDays < 0,
+          pending: rows.length === 0 || dueInDays < 0 || (latest?.responseVerdict ?? '待判定') !== '合格',
           worstVerdict,
           trend: [...rows]
             .reverse()
@@ -91,11 +94,11 @@ export function useCalibHistory(): UseCalibHistoryResult {
         };
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, instruments, stations]);
+  }, [arrays, calibrations, devices, installs, stations]);
 
   const historyOf = useCallback(
-    (instrumentId: string): InstrumentCalibHistory | null =>
-      histories.find((history) => history.instrument.id === instrumentId) ?? null,
+    (serialNo: string): DeviceCalibHistory | null =>
+      histories.find((history) => history.device.serialNo === serialNo) ?? null,
     [histories]
   );
 
@@ -105,8 +108,8 @@ export function useCalibHistory(): UseCalibHistoryResult {
   );
 
   const trendOf = useCallback(
-    (instrumentId: string): Array<{ date: string; sensitivity: number; selfNoise: number }> =>
-      histories.find((history) => history.instrument.id === instrumentId)?.trend ?? [],
+    (serialNo: string): Array<{ date: string; sensitivity: number; selfNoise: number }> =>
+      histories.find((history) => history.device.serialNo === serialNo)?.trend ?? [],
     [histories]
   );
 
@@ -114,9 +117,9 @@ export function useCalibHistory(): UseCalibHistoryResult {
 }
 
 /** 标定周期说明文案，供页面提示 */
-export const CALIBRATION_CYCLE_TEXT = `标定周期 ${CALIBRATION_CYCLE_DAYS} 天（约 1 年），超期仪器在更换提醒页高亮`;
+export const CALIBRATION_CYCLE_TEXT = `标定周期 ${CALIBRATION_CYCLE_DAYS} 天（约 1 年），合格到期未标定即超期高亮`;
 
 /** 待标定天数文案 */
-export function dueText(history: InstrumentCalibHistory): string {
+export function dueText(history: DeviceCalibHistory): string {
   return calibrateDueText(history.dueInDays);
 }

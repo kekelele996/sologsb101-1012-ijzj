@@ -45,10 +45,11 @@ import {
   syncStationCount,
   updateArray,
 } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
-import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectInstalls } from '@/stores/installSlice';
+import { selectCalibrations, selectClaims, selectReplaces } from '@/stores/calibrationSlice';
 import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
-import { apertureKm, round } from '@/utils/geo';
+import { apertureKm } from '@/utils/geo';
+import { qualifyStatForInstalls } from '@/utils/qualify';
 import { initDatabase } from '@/utils/db';
 
 interface ArrayFormValues {
@@ -67,9 +68,10 @@ export default function ArrayList() {
 
   const arrays = useAppSelector(selectArrays);
   const stations = useAppSelector(selectStations);
-  const instruments = useAppSelector(selectInstruments);
+  const installs = useAppSelector(selectInstalls);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const claims = useAppSelector(selectClaims);
   const filter = useAppSelector(selectArrayFilter);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
 
@@ -121,22 +123,20 @@ export default function ArrayList() {
     });
   }, [arrays, filter]);
 
-  /** 台阵卡片统计：台站数、仪器数、标定数、不合格数与实算孔径 */
+  /** 台阵卡片统计：台站数、安装位、当前设备合格率与实算孔径 */
   const cards = useMemo(
     () =>
       filtered.map((row) => {
         const arrayStations = stations.filter((station) => station.arrayId === row.id);
         const stationIds = new Set(arrayStations.map((station) => station.id));
-        const arrayInstruments = instruments.filter((instrument) => stationIds.has(instrument.stationId));
-        const instrumentIds = new Set(arrayInstruments.map((instrument) => instrument.id));
-        const arrayCalibrations = calibrations.filter((calibration) =>
-          instrumentIds.has(calibration.instrumentId)
-        );
-        const unqualified = arrayCalibrations.filter(
-          (calibration) => calibration.responseVerdict === '不合格'
-        ).length;
+        const arrayInstalls = installs.filter((install) => stationIds.has(install.stationId));
+        const installIds = new Set(arrayInstalls.map((install) => install.id));
+        const stat = qualifyStatForInstalls(arrayInstalls, calibrations);
         const pendingReplace = replaces.filter(
-          (replace) => instrumentIds.has(replace.instrumentId) && replace.state !== '已复核'
+          (replace) => installIds.has(replace.installId) && replace.state !== '已复核'
+        ).length;
+        const pendingClaims = claims.filter(
+          (claim) => claim.stationId && stationIds.has(claim.stationId) && claim.state === '待认领'
         ).length;
         const computed = apertureKm(
           arrayStations.map((station) => ({
@@ -149,27 +149,26 @@ export default function ArrayList() {
         return {
           row,
           stationCount: arrayStations.length,
-          instrumentCount: arrayInstruments.length,
-          calibrationCount: arrayCalibrations.length,
-          unqualified,
+          installCount: arrayInstalls.length,
+          calibrationCount: stat.calibrationCount,
+          unqualified: stat.unqualifiedCalibrations,
           pendingReplace,
+          pendingClaims,
           computedApertureKm: computed,
-          qualifyRate:
-            arrayCalibrations.length === 0
-              ? 0
-              : round(((arrayCalibrations.length - unqualified) / arrayCalibrations.length) * 100, 1),
+          qualifyRate: stat.qualifyRate,
         };
       }),
-    [calibrations, filtered, instruments, replaces, stations]
+    [calibrations, claims, filtered, installs, replaces, stations]
   );
 
   const totals = useMemo(
     () => ({
       arrays: cards.length,
       stations: cards.reduce((sum, card) => sum + card.stationCount, 0),
-      instruments: cards.reduce((sum, card) => sum + card.instrumentCount, 0),
+      installs: cards.reduce((sum, card) => sum + card.installCount, 0),
       unqualified: cards.reduce((sum, card) => sum + card.unqualified, 0),
       pendingReplace: cards.reduce((sum, card) => sum + card.pendingReplace, 0),
+      pendingClaims: cards.reduce((sum, card) => sum + card.pendingClaims, 0),
     }),
     [cards]
   );
@@ -263,7 +262,7 @@ export default function ArrayList() {
 
   const handleRemove = async (row: SeisArray) => {
     await dispatch(removeArray(row.id)).unwrap();
-    message.success(`台阵「${row.name}」及其台站、仪器、标定记录已删除`);
+    message.success(`台阵「${row.name}」及其台站、安装位已删除（物理仪器与标定保留）`);
   };
 
   const gotoSections = (row: SeisArray) => {
@@ -287,7 +286,7 @@ export default function ArrayList() {
             台阵与台站台账
           </Typography.Title>
           <p className="gb-hint">
-            维护台阵孔径、布设日期与运行状态，台站数与实算孔径自动汇总回显。点击「台站仪器」进入子页面。
+            维护台阵孔径、布设日期与运行状态，台站数、安装位与当前设备合格率自动汇总回显。点击「台站安装位」进入子页面。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
@@ -337,7 +336,7 @@ export default function ArrayList() {
       <div className="gb-stats-row">
         <StatBadge label="筛选后台阵" value={totals.arrays} suffix="个" tone="primary" />
         <StatBadge label="台站总数" value={totals.stations} suffix="个" tone="info" />
-        <StatBadge label="仪器总数" value={totals.instruments} suffix="台" tone="default" />
+        <StatBadge label="安装位总数" value={totals.installs} suffix="个" tone="default" />
         <StatBadge
           label="不合格标定"
           value={totals.unqualified}
@@ -350,12 +349,18 @@ export default function ArrayList() {
           suffix="条"
           tone={totals.pendingReplace > 0 ? 'warning' : 'success'}
         />
+        <StatBadge
+          label="待认领序列号"
+          value={totals.pendingClaims}
+          suffix="个"
+          tone={totals.pendingClaims > 0 ? 'warning' : 'success'}
+        />
       </div>
 
       {cards.length === 0 ? (
         <EmptyPanel
           title={filter.keyword || filter.states.length > 0 ? '没有符合条件的台阵' : '还没有台阵'}
-          description="新建第一个台阵后即可布设台站、登记仪器并按次录入标定结果。"
+          description="新建第一个台阵后即可布设台站、登记安装位与当前序列号，并由计量站按序列号录入标定结果。"
           actionText="新建台阵"
           secondaryText="重置筛选"
           onAction={openCreate}
@@ -382,9 +387,9 @@ export default function ArrayList() {
               >
                 <div className="gb-stats-row" style={{ marginBottom: 10 }}>
                   <StatBadge label="台站" value={card.stationCount} suffix="个" size="small" tone="info" />
-                  <StatBadge label="仪器" value={card.instrumentCount} suffix="台" size="small" />
+                  <StatBadge label="安装位" value={card.installCount} suffix="个" size="small" />
                   <StatBadge
-                    label="标定合格率"
+                    label="当前设备合格率"
                     value={card.qualifyRate}
                     percent={card.qualifyRate}
                     size="small"
@@ -397,16 +402,19 @@ export default function ArrayList() {
                     <b className="gb-mono">{card.computedApertureKm}</b> km
                   </span>
                   <span>
-                    累计标定 <b className="gb-mono">{card.calibrationCount}</b> 次
+                    当前设备标定 <b className="gb-mono">{card.calibrationCount}</b> 次
                     {card.unqualified > 0 ? (
                       <span className="gb-danger"> · 不合格 {card.unqualified} 次</span>
+                    ) : null}
+                    {card.pendingClaims > 0 ? (
+                      <span className="gb-warning"> · 待认领 {card.pendingClaims} 个</span>
                     ) : null}
                   </span>
                   <span>管理部门：{card.row.department || '未填写'}</span>
                 </Space>
                 <Space wrap style={{ marginTop: 12 }}>
                   <Button type="primary" size="small" icon={<RightOutlined />} onClick={() => gotoSections(card.row)}>
-                    台站仪器
+                    台站安装位
                   </Button>
                   <Button size="small" icon={<SyncOutlined />} onClick={() => void handleRecompute(card.row)}>
                     重算孔径
@@ -416,7 +424,7 @@ export default function ArrayList() {
                   </Button>
                   <Popconfirm
                     title="删除台阵"
-                    description={`将同时删除其台站、仪器、标定与更换记录，确认删除「${card.row.name}」？`}
+                    description={`将同时删除其台站、安装位与更换记录（物理仪器、标定保留），确认删除「${card.row.name}」？`}
                     okText="删除"
                     cancelText="取消"
                     okButtonProps={{ danger: true }}

@@ -60,23 +60,28 @@ export const updateArray = createAsyncThunk(
   }
 );
 
-/** 删除台阵：级联删除台站、仪器、标定与更换记录 */
+/** 删除台阵：级联删除台站、安装位与更换记录；物理仪器与标定按序列号保留在计量侧 */
 export const removeArray = createAsyncThunk('array/removeArray', async (arrayId: string) => {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.installs, db.replaces, db.claims],
     async () => {
       const stationIds = (await db.stations.where('arrayId').equals(arrayId).toArray()).map(
         (row) => row.id
       );
       if (stationIds.length > 0) {
-        const instrumentIds = (
-          await db.instruments.where('stationId').anyOf(stationIds).toArray()
-        ).map((row) => row.id);
-        if (instrumentIds.length > 0) {
-          await db.calibrations.where('instrumentId').anyOf(instrumentIds).delete();
-          await db.replaces.where('instrumentId').anyOf(instrumentIds).delete();
-          await db.instruments.bulkDelete(instrumentIds);
+        const installs = await db.installs.where('stationId').anyOf(stationIds).toArray();
+        const installIds = installs.map((row) => row.id);
+        if (installIds.length > 0) {
+          await db.replaces.where('installId').anyOf(installIds).delete();
+          // 安装位随台站删除：仅撤掉尚未认领的挂账；认过的留痕不退回
+          const pendingClaims = await db.claims
+            .where('installId')
+            .anyOf(installIds)
+            .and((claim) => claim.state === '待认领')
+            .primaryKeys();
+          if (pendingClaims.length > 0) await db.claims.bulkDelete(pendingClaims);
+          await db.installs.bulkDelete(installIds);
         }
         await db.stations.bulkDelete(stationIds);
       }
@@ -104,16 +109,21 @@ export const updateStation = createAsyncThunk(
   }
 );
 
-/** 删除台站：级联删除仪器、标定与更换记录 */
+/** 删除台站：级联删除安装位与更换记录；物理仪器与标定保留 */
 export const removeStation = createAsyncThunk('array/removeStation', async (stationId: string) => {
-  await db.transaction('rw', [db.stations, db.instruments, db.calibrations, db.replaces], async () => {
-    const instrumentIds = (
-      await db.instruments.where('stationId').equals(stationId).toArray()
-    ).map((row) => row.id);
-    if (instrumentIds.length > 0) {
-      await db.calibrations.where('instrumentId').anyOf(instrumentIds).delete();
-      await db.replaces.where('instrumentId').anyOf(instrumentIds).delete();
-      await db.instruments.bulkDelete(instrumentIds);
+  await db.transaction('rw', [db.stations, db.installs, db.replaces, db.claims], async () => {
+    const installIds = (await db.installs.where('stationId').equals(stationId).toArray()).map(
+      (row) => row.id
+    );
+    if (installIds.length > 0) {
+      await db.replaces.where('installId').anyOf(installIds).delete();
+      const pendingClaims = await db.claims
+        .where('installId')
+        .anyOf(installIds)
+        .and((claim) => claim.state === '待认领')
+        .primaryKeys();
+      if (pendingClaims.length > 0) await db.claims.bulkDelete(pendingClaims);
+      await db.installs.bulkDelete(installIds);
     }
     await db.stations.delete(stationId);
   });

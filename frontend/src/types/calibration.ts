@@ -1,13 +1,18 @@
+/**
+ * 标定（计量站维护）：按物理仪器序列号挂记录。
+ * 同一序列号可叠加多次标定，换机不影响历史归属；合格到期日由最近一次合格标定派生。
+ */
+
 /** 响应结论 */
 export type ResponseVerdict = '合格' | '不合格' | '待判定';
 
 export const RESPONSE_VERDICTS: ResponseVerdict[] = ['合格', '不合格', '待判定'];
 
-/** 标定：同一仪器可叠加多次标定记录 */
+/** 标定记录：归属物理仪器序列号，而不是安装位 */
 export interface Calibration {
   id: string;
-  /** 被标定仪器 */
-  instrumentId: string;
+  /** 被标定仪器的序列号（历次标定跟着序列号走） */
+  serialNo: string;
   /** 标定日期 */
   date: string;
   /** 灵敏度（V·s/m） */
@@ -33,7 +38,7 @@ export interface Calibration {
 export const SENSITIVITY_RANGE: Record<string, { min: number; max: number }> = {
   宽频带: { min: 800, max: 3000 },
   短周期: { min: 100, max: 800 },
-  强震: { min: 0.1, max: 5 }
+  强震: { min: 0.1, max: 5 },
 };
 
 export const SELF_NOISE_LIMIT = 3.5;
@@ -73,8 +78,8 @@ export interface CalibrationFilterState {
   keyword: string;
   verdicts: ResponseVerdict[];
   instrumentTypes: string[];
-  /** 是否只看超期未标定仪器 */
-  onlyOverdue: boolean;
+  /** 是否只看不合格记录 */
+  onlyUnqualified: boolean;
 }
 
 export function createEmptyCalibrationFilter(): CalibrationFilterState {
@@ -82,7 +87,7 @@ export function createEmptyCalibrationFilter(): CalibrationFilterState {
     keyword: '',
     verdicts: [],
     instrumentTypes: [],
-    onlyOverdue: false
+    onlyUnqualified: false,
   };
 }
 
@@ -90,6 +95,6 @@ export function createEmptyCalibrationFilter(): CalibrationFilterState {
 export function calibrateDueText(dueInDays: number): string {
   if (!Number.isFinite(dueInDays)) return '标定日期缺失';
   if (dueInDays === 0) return '今日到期';
-  if (dueInDays > 0) return `距下次标定 ${dueInDays} 天`;
+  if (dueInDays > 0) return `距合格到期 ${dueInDays} 天`;
   return `已超期 ${Math.abs(dueInDays)} 天`;
 }
